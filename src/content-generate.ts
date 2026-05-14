@@ -2,6 +2,7 @@ import { FilesBuilder } from "./files-builder";
 import { stripIndents } from "common-tags";
 import { GetNativeType, NativeDefinition, NativeParam } from "./types";
 import { terminal as term } from "terminal-kit";
+import { NativeParamOverrides, GlobalParamOverrides } from "./overrides";
 
 interface TemplateObject {
   desc: string;
@@ -43,8 +44,9 @@ export class ContentGenerate {
     param: string,
     returnType: string | string[],
     _function: string,
+    overloads?: string,
     aliases?: string
-  ) => `${description}${param || ""}${
+  ) => `${description}${overloads || ""}${param || ""}${
     returnType !== "void"
       ? typeof returnType === "object"
         ? this.createMultipleReturnTypes(returnType)
@@ -158,7 +160,7 @@ ${aliases ? `${aliases}\n` : ""}`;
         const nativeParams: {
           luaDocs: string;
           params: string;
-        } = this.nativeParams(native);
+        } = this.nativeParams(native, nativeName);
 
         const functionTemplate = `function ${nativeName}(${nativeParams.params}) end`;
 
@@ -172,6 +174,7 @@ ${aliases ? `${aliases}\n` : ""}`;
           nativeParams.luaDocs,
           newReturnTypes.map((type) => GetNativeType(type)),
           functionTemplate,
+          this.getOverloads(native, nativeName),
           aliases
         );
       }
@@ -349,7 +352,8 @@ ${aliases ? `${aliases}\n` : ""}`;
    * @return JSON<String luaDocs, String params, String paramsWithType>
    */
   private nativeParams = (
-    data: NativeDefinition
+    data: NativeDefinition,
+    nativeName: string
   ): { luaDocs: string; params: string } => {
     /**
      * "luaDocs" Allows to save the generation of LUA documentation and return it
@@ -365,17 +369,115 @@ ${aliases ? `${aliases}\n` : ""}`;
 
       if (nativeParam.type.includes("*")) continue;
 
-      const convNativeType = GetNativeType(nativeParam.type, true);
+      const override = NativeParamOverrides[data.name]?.[nativeParam.name] || NativeParamOverrides[nativeName]?.[nativeParam.name] || GlobalParamOverrides[nativeParam.name];
+      const paramName = override?.name || nativeParam.name;
+      const convNativeType = override?.type || GetNativeType(nativeParam.type, true);
+
+      const isOptional = override?.optional || override?.defaultValue !== undefined;
+      const defaultValue = override?.defaultValue;
 
       luaDocs += `\n---@param ${this.fieldToReplace(
-        nativeParam.name
-      )} ${convNativeType}`;
+        paramName
+      )}${isOptional ? "?" : ""} ${convNativeType}${defaultValue !== undefined ? ` [default: ${defaultValue}]` : ""}`;
       params +=
-        (paramPos != 0 ? ", " : "") + this.fieldToReplace(nativeParam.name);
+        (paramPos != 0 ? ", " : "") + this.fieldToReplace(paramName);
       paramPos++;
     }
 
     return { luaDocs: luaDocs, params: params };
+  };
+
+  /**
+   * Generates overloads for natives that take x, y, z as separate arguments
+   * @param data
+   * @param nativeName
+   * @returns string
+   */
+  private getOverloads = (data: NativeDefinition, nativeName: string): string => {
+    const params = data.params.filter((p) => !p.type.includes("*"));
+    const setsFound: number[] = [];
+
+    const coordPatterns = ["", "pos", "rot", "rotation", "offset", "vec", "a"];
+    const checkCoord = (n: string, axis: string) => {
+      const name = n.toLowerCase();
+      return coordPatterns.some((p) => name === p + axis || name === axis + p);
+    };
+
+    for (let i = 0; i < params.length - 2; i++) {
+      if (
+        checkCoord(params[i].name, "x") &&
+        checkCoord(params[i + 1].name, "y") &&
+        checkCoord(params[i + 2].name, "z")
+      ) {
+        setsFound.push(i);
+        i += 2;
+      }
+    }
+
+    if (setsFound.length === 0) return "";
+
+    const returnTypes = (data.results ? [data.results] : ["void"]).map((t) =>
+      GetNativeType(t)
+    );
+    // Add out params to return types
+    for (const p of data.params) {
+      if (
+        p.type.includes("*") &&
+        !this.isNonReturnPointerNative(data.name) &&
+        !p.type.toLowerCase().includes("char")
+      ) {
+        returnTypes.push(GetNativeType(p.type.replace("*", "")));
+      }
+    }
+
+    const returnStr = returnTypes.filter((t) => t !== "void").join(", ");
+    const formattedReturn =
+      returnStr !== ""
+        ? returnTypes.filter((t) => t !== "void").length > 1
+          ? `: (${returnStr})`
+          : `: ${returnStr}`
+        : "";
+
+    let overloadsStr = "";
+
+    // Generate all combinations (excluding the case with no vectors)
+    const numSets = setsFound.length;
+    const numCombinations = Math.pow(2, numSets);
+
+    for (let combo = 1; combo < numCombinations; combo++) {
+      const overloadParams: string[] = [];
+      for (let i = 0; i < params.length; i++) {
+        const setIdx = setsFound.indexOf(i);
+        if (setIdx !== -1 && combo & (1 << setIdx)) {
+          const pName = params[i].name.toLowerCase();
+          let name = "coords";
+          if (pName.includes("rot")) name = "rotation";
+          else if (pName.includes("offset")) name = "offset";
+          else if (pName.includes("dir") || pName.includes("forward"))
+            name = "direction";
+
+          overloadParams.push(`${name}: vector3`);
+          i += 2;
+          continue;
+        }
+
+        const nativeParam = params[i];
+        const override =
+          NativeParamOverrides[data.name]?.[nativeParam.name] ||
+          NativeParamOverrides[nativeName]?.[nativeParam.name] ||
+          GlobalParamOverrides[nativeParam.name];
+        const paramName = override?.name || nativeParam.name;
+        const paramType =
+          override?.type || GetNativeType(nativeParam.type, true);
+
+        overloadParams.push(`${this.fieldToReplace(paramName)}: ${paramType}`);
+      }
+      overloadsStr += `\n---@overload fun(${overloadParams.join(
+        ", "
+      )})${formattedReturn}`;
+    }
+
+    return overloadsStr;
   };
 
   /**
