@@ -416,7 +416,7 @@ ${aliases ? `${aliases}\n` : ""}`;
 
     if (setsFound.length === 0) return "";
 
-    const returnTypes = (data.results ? [data.results] : ["void"]).map((t) =>
+    const returnTypes = (data.results ? [this.seperateObjectTypes(data.results)] : ["void"]).map((t) =>
       GetNativeType(t)
     );
     // Add out params to return types
